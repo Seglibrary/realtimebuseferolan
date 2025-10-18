@@ -43,11 +43,21 @@ class TranscriptionSession {
     this.sampleRate = 24000; // Default sample rate
     this.sessionStartTime = Date.now();
     this.lastAnalysisTime = Date.now();
+    
+    // YENİ: Optimizasyon parametreleri
+    this.minAnalysisInterval = 2000; // 5s yerine 2s
+    this.transcriptsSinceLastAnalysis = 0;
+    this.transcriptThreshold = 3; // 3 transcript gelince analiz et
+    this.lastTranscriptTime = Date.now();
+    this.correctionCache = new Map(); // Düzeltme önbelleği
+    this.targetLanguage = 'en'; // Hedef çeviri dili
   }
 
   // Rolling context window (60 saniye)
   addToContext(text, timestamp) {
     this.contextBuffer.push({ text, timestamp });
+    this.transcriptsSinceLastAnalysis++;
+    this.lastTranscriptTime = timestamp;
     
     // 60 saniyeden eski kayıtları temizle
     const cutoffTime = Date.now() - 60000;
@@ -58,6 +68,24 @@ class TranscriptionSession {
     this.currentContext = this.contextBuffer
       .map(item => item.text)
       .join(' ');
+  }
+
+  // YENİ: Akıllı tetikleme - birden fazla koşul
+  shouldTriggerAnalysis() {
+    const timeSinceLastAnalysis = Date.now() - this.lastAnalysisTime;
+    const timeSinceLastTranscript = Date.now() - this.lastTranscriptTime;
+    
+    return (
+      // Koşul 1: Minimum süre geçti VE yeni transkript var
+      (timeSinceLastAnalysis > this.minAnalysisInterval && 
+       this.transcriptsSinceLastAnalysis > 0) ||
+      
+      // Koşul 2: Belirli sayıda transkript birikti
+      this.transcriptsSinceLastAnalysis >= this.transcriptThreshold ||
+      
+      // Koşul 3: Konuşma durdu (2 saniye sessizlik)
+      timeSinceLastTranscript > 2000
+    );
   }
 
   // OpenAI Realtime API'ye bağlan
@@ -177,10 +205,16 @@ class TranscriptionSession {
           },
         }));
         
-        // Her 5 saniyede bir context analizi yap
-        if (Date.now() - this.lastAnalysisTime > 5000) {
+        // YENİ: Akıllı tetikleme
+        if (this.shouldTriggerAnalysis()) {
           this.lastAnalysisTime = Date.now();
-          await this.analyzeAndCorrect();
+          this.transcriptsSinceLastAnalysis = 0;
+          
+          // Paralel çalıştır: düzeltme ve çeviriyi aynı anda başlat
+          Promise.all([
+            this.analyzeAndCorrect(),
+            this.autoTranslate() // YENİ fonksiyon
+          ]).catch(err => console.error('Analysis error:', err));
         }
         break;
 
@@ -210,54 +244,54 @@ class TranscriptionSession {
     }
   }
 
-  // Context-aware correction engine
+  // YENİ: Cache'li düzeltme
   async analyzeAndCorrect() {
-    if (this.currentContext.length < 50) return; // Minimum context gerekli
+    if (this.currentContext.length < 30) return; // 50'den 30'a düşür
 
     try {
-      console.log('🔍 Analyzing context for corrections...');
+      // Cache kontrolü - son 20 kelimeyi key olarak kullan
+      const contextKey = this.currentContext.split(' ').slice(-20).join(' ');
+      const cached = this.correctionCache.get(contextKey);
       
-      const prompt = `Analyze this real-time speech transcript and find entity recognition errors.
+      if (cached && Date.now() - cached.timestamp < 30000) {
+        console.log('✅ Using cached corrections');
+        this.sendCorrections(cached.data);
+        return;
+      }
 
-Transcript: "${this.currentContext}"
+      console.log('🔍 Analyzing context...');
+      
+      // YENİ: Daha kısa prompt, sadece son 200 karakter
+      const recentContext = this.currentContext.slice(-200);
+      
+      const prompt = `Analyze this speech transcript for entity errors.
 
-Common error patterns:
-- Homophones: "NBC" → "NBA" (basketball), "MVW" → "MVP" (awards)
-- Name corrections: "Lebron Harden" → "LeBron James"
-- Organization names based on context
-- Scientific terms: "RNA" vs "NBA" based on topic
+Text: "${recentContext}"
 
-Detect the current conversation topic (sports, science, tech, etc.) and correct accordingly.
+Common patterns:
+- Homophones: NBC→NBA, MVW→MVP
+- Names based on context
 
-Return ONLY valid JSON in this exact format:
+Return JSON:
 {
-  "topic": "detected topic",
-  "corrections": [
-    {
-      "original": "wrong text",
-      "corrected": "right text",
-      "position": "approximate word position",
-      "confidence": 0.95,
-      "reason": "brief explanation"
-    }
-  ]
-}
-
-If no corrections needed, return: {"topic": "detected topic", "corrections": []}`;
+  "topic": "topic",
+  "corrections": [{"original": "X", "corrected": "Y", "confidence": 0.9}]
+}`;
 
       const response = await initializeOpenAI(process.env.OPENAI_API_KEY).chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
           {
             role: 'system',
-            content: 'You are an expert at detecting and correcting named entity recognition errors in speech transcripts. Always respond with valid JSON only.',
+            content: 'You are an expert at correcting entity errors. Respond with JSON only.',
           },
           {
             role: 'user',
             content: prompt,
           },
         ],
-        temperature: 0.3,
+        temperature: 0.2, // 0.3'ten 0.2'ye düşür (daha deterministik)
+        max_tokens: 200, // Token limitini ekle (hız için)
         response_format: { type: 'json_object' },
       });
 
@@ -266,18 +300,43 @@ If no corrections needed, return: {"topic": "detected topic", "corrections": []}
       if (result.corrections && result.corrections.length > 0) {
         console.log('✅ Found corrections:', result.corrections);
         
-        // Client'a düzeltmeleri gönder
-        this.ws.send(JSON.stringify({
-          type: 'corrections',
-          data: {
-            topic: result.topic,
-            corrections: result.corrections,
-          },
-        }));
+        // Cache'e ekle
+        this.correctionCache.set(contextKey, {
+          data: result,
+          timestamp: Date.now()
+        });
+        
+        this.sendCorrections(result);
       }
 
     } catch (error) {
-      console.error('❌ Correction analysis failed:', error);
+      console.error('❌ Correction failed:', error);
+    }
+  }
+
+  sendCorrections(result) {
+    this.ws.send(JSON.stringify({
+      type: 'corrections',
+      data: {
+        topic: result.topic,
+        corrections: result.corrections,
+      },
+    }));
+  }
+
+  // YENİ: Otomatik çeviri (debounce olmadan)
+  async autoTranslate() {
+    // Son 3 transkripti al (daha kısa context)
+    const recentTranscripts = this.contextBuffer
+      .slice(-3)
+      .map(item => item.text)
+      .join(' ');
+    
+    if (recentTranscripts.length < 20) return; // Çok kısa metinleri atla
+    
+    // Çeviriyi başlat (frontend'den gelen hedef dil ile)
+    if (this.targetLanguage && this.targetLanguage !== 'Original') {
+      await this.translate(recentTranscripts, this.targetLanguage);
     }
   }
 
@@ -291,28 +350,32 @@ If no corrections needed, return: {"topic": "detected topic", "corrections": []}
     }
   }
 
-  // Çeviri yap
   async translate(text, targetLanguage) {
     try {
+      // YENİ: Daha kısa context (500'den 200'e)
+      const shortContext = this.currentContext.slice(-200);
+      
       const stream = await initializeOpenAI(process.env.OPENAI_API_KEY).chat.completions.create({
         model: 'gpt-4o',
         messages: [
           {
             role: 'system',
-            content: `You are a professional translator. Translate to ${targetLanguage}.
-Rules:
-- Preserve named entities (names, brands, organizations)
-- Maintain the tone and style
-- Use the context provided
-Context: ${this.currentContext.slice(-500)}`, // Son 500 karakter
+            content: `Translate to ${targetLanguage}. Preserve names and brands. Context: ${shortContext}`,
           },
           {
             role: 'user',
             content: text,
           },
         ],
+        max_tokens: 300, // Token limiti ekle
         stream: true,
       });
+
+      // Stream başladı işareti
+      this.ws.send(JSON.stringify({
+        type: 'translation_start',
+        data: { language: targetLanguage }
+      }));
 
       // Stream translation to client
       for await (const chunk of stream) {
@@ -414,6 +477,12 @@ wss.on('connection', (ws, req) => {
             console.log('🌐 Language set to:', languageCode);
           }
           
+          // YENİ: Hedef çeviri dilini session'a kaydet
+          if (data.targetLanguage) {
+            session.targetLanguage = data.targetLanguage;
+            console.log('🎯 Target language set to:', data.targetLanguage);
+          }
+          
           // Sample rate bilgisini session'a kaydet
           if (data.sampleRate) {
             // Desteklenen sample rate'leri kontrol et
@@ -472,6 +541,11 @@ wss.on('connection', (ws, req) => {
               },
             }));
           }
+          break;
+
+        case 'update_target_language':
+          console.log('🎯 Updating target language to:', data.targetLanguage);
+          session.targetLanguage = data.targetLanguage;
           break;
 
         case 'stop':
