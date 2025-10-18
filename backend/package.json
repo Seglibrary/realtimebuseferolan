@@ -1,0 +1,21 @@
+{
+  "name": "realtime-translator-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Real-time AI translation backend with context-aware correction",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "ws": "^8.18.0",
+    "openai": "^4.67.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7"
+  }
+}
