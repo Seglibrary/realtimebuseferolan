@@ -385,9 +385,29 @@ Return JSON:
 
       console.log('🔍 Analyzing context...');
       
-      // 🆕 ADIM 2.1: Dinamik prompt - keyword extraction
+      // 🆕 ADIM 2.4: Performans optimizasyonu
       const recentContext = this.currentContext.slice(-200);
-      const dynamicPrompt = await this.buildDynamicPrompt(recentContext);
+      
+      // Background'da keyword extraction (bekleme yok!)
+      this.buildDynamicPrompt(recentContext).catch(err => 
+        console.error('❌ Keyword extraction background error:', err)
+      );
+      
+      // Hızlı prompt kullan (keyword extraction beklemeden)
+      const quickPrompt = `Analyze this speech transcript for transcription errors.
+
+Text: "${recentContext}"
+
+Common errors:
+- Homophones (hear/here, see/sea)
+- Entity names
+- Technical terms
+
+Return JSON:
+{
+  "topic": "detected topic",
+  "corrections": [{"original": "X", "corrected": "Y", "confidence": 0.9}]
+}`;
       
       // 🔧 FIX: Session'daki API key kullan (this.apiKey)
       const response = await initializeOpenAI(this.apiKey || process.env.OPENAI_API_KEY).chat.completions.create({
@@ -399,7 +419,7 @@ Return JSON:
           },
           {
             role: 'user',
-            content: dynamicPrompt,
+            content: quickPrompt,
           },
         ],
         temperature: 0.2,
@@ -498,20 +518,21 @@ Return JSON:
 
   async translate(text, targetLanguage, chunkId) { // 🆕 ADIM 1.0c: chunkId parametresi eklendi
     try {
-      // 🔧 FIX: Context kaldırıldı - her chunk bağımsız çevrilsin
+      // 🔧 ADIM 2.4.2: Kısa prompt + düşük token
       const stream = await initializeOpenAI(process.env.OPENAI_API_KEY).chat.completions.create({
         model: 'gpt-4o',
         messages: [
           {
             role: 'system',
-            content: `Translate to ${targetLanguage}. Preserve names and brands. Translate ONLY the given text, nothing more.`,
+            content: `Translate to ${targetLanguage}. Keep names as-is.`,
           },
           {
             role: 'user',
             content: text,
           },
         ],
-        max_tokens: 300, // Token limiti ekle
+        max_tokens: 150, // 🔧 300→150 (chunk'lar küçük)
+        temperature: 0.3, // 🔧 Consistency için
         stream: true,
       });
 
@@ -524,20 +545,45 @@ Return JSON:
         }
       }));
 
-      // Stream translation to client (🆕 for_chunk_id eklendi)
+      // 🔧 ADIM 2.4.3: Batching ile streaming optimize et
+      let buffer = '';
+      let lastSendTime = Date.now();
+      const BATCH_INTERVAL = 50; // 50ms batching (UI için daha akıcı)
+      
       for await (const chunk of stream) {
         const content = chunk.choices[0]?.delta?.content || '';
         if (content) {
-          this.ws.send(JSON.stringify({
-            type: 'translation',
-            data: {
-              text: content,
-              language: targetLanguage,
-              partial: true,
-              for_chunk_id: chunkId // 🆕 ADIM 1.0c
-            },
-          }));
+          buffer += content;
+          
+          // 50ms'de bir veya buffer dolunca gönder
+          const now = Date.now();
+          if (now - lastSendTime >= BATCH_INTERVAL || buffer.length > 50) {
+            this.ws.send(JSON.stringify({
+              type: 'translation',
+              data: {
+                text: buffer,
+                language: targetLanguage,
+                partial: true,
+                for_chunk_id: chunkId // 🆕 ADIM 1.0c
+              },
+            }));
+            buffer = '';
+            lastSendTime = now;
+          }
         }
+      }
+      
+      // Kalan buffer'ı gönder
+      if (buffer) {
+        this.ws.send(JSON.stringify({
+          type: 'translation',
+          data: {
+            text: buffer,
+            language: targetLanguage,
+            partial: true,
+            for_chunk_id: chunkId
+          },
+        }));
       }
 
       // Translation complete (🆕 for_chunk_id eklendi)
