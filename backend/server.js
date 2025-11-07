@@ -52,6 +52,10 @@ class TranscriptionSession {
     this.correctionCache = new Map(); // Düzeltme önbelleği
     this.targetLanguage = 'en'; // Hedef çeviri dili
     
+    // 🆕 ADIM 2.2: Keyword cache (performans optimizasyonu)
+    this.keywordCache = new Map(); // Context → keywords mapping
+    this.KEYWORD_CACHE_TTL = 60000; // 60 saniye cache
+    
     // 🆕 ADIM 1.0a: Atomik ID sistemi
     this.chunkCounter = 0; // Benzersiz ID için sayaç
     this.chunksMap = new Map(); // ID → Chunk mapping
@@ -289,6 +293,80 @@ class TranscriptionSession {
     }
   }
 
+  // 🆕 ADIM 2.1: Dinamik prompt builder
+  async buildDynamicPrompt(context) {
+    try {
+      // 🆕 ADIM 2.2: Keyword cache kontrolü (performans)
+      const cacheKey = context.slice(-100); // Son 100 karakter key olarak
+      const cached = this.keywordCache.get(cacheKey);
+      
+      let keywords;
+      if (cached && Date.now() - cached.timestamp < this.KEYWORD_CACHE_TTL) {
+        keywords = cached.keywords;
+        console.log('✅ Using cached keywords:', keywords);
+      } else {
+        // ADIM 1: GPT ile keyword extraction (bağlamsal analiz için)
+        // 🔧 FIX: Session'daki API key kullan (this.apiKey)
+        const keywordResponse = await initializeOpenAI(this.apiKey || process.env.OPENAI_API_KEY).chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [{
+            role: 'user',
+            content: `Extract 3-5 key topics, entities, or context clues from this transcript. 
+Ignore filler words. Focus on what the user is talking about.
+Return comma-separated list:
+
+"${context}"
+
+Key topics:`
+          }],
+          max_tokens: 30,
+          temperature: 0.3
+        });
+        
+        keywords = keywordResponse.choices[0].message.content.trim();
+        
+        // Cache'e ekle
+        this.keywordCache.set(cacheKey, {
+          keywords,
+          timestamp: Date.now()
+        });
+        
+        console.log('🔑 Extracted keywords:', keywords);
+      }
+      
+      // ADIM 2: Bağlamsal prompt oluştur
+      return `Analyze this speech transcript for transcription errors.
+
+Context clues (what user is talking about): ${keywords}
+
+Text: "${context}"
+
+Consider:
+1. Homophones based on context (e.g., "resim" vs "sesim" in mic test)
+2. Entity names that match the context
+3. Technical terms related to: ${keywords}
+
+Return JSON:
+{
+  "topic": "${keywords}",
+  "corrections": [{"original": "X", "corrected": "Y", "confidence": 0.9}]
+}`;
+
+    } catch (error) {
+      console.error('❌ Keyword extraction failed:', error);
+      // Fallback: basit prompt
+      return `Analyze this speech transcript for entity errors.
+
+Text: "${context}"
+
+Return JSON:
+{
+  "topic": "general",
+  "corrections": [{"original": "X", "corrected": "Y", "confidence": 0.9}]
+}`;
+    }
+  }
+
   // YENİ: Cache'li düzeltme
   async analyzeAndCorrect() {
     // 🔧 FIX: Minimum context kontrolü kaldırıldı - ilk cümleden itibaren düzelt
@@ -307,37 +385,25 @@ class TranscriptionSession {
 
       console.log('🔍 Analyzing context...');
       
-      // YENİ: Daha kısa prompt, sadece son 200 karakter
+      // 🆕 ADIM 2.1: Dinamik prompt - keyword extraction
       const recentContext = this.currentContext.slice(-200);
+      const dynamicPrompt = await this.buildDynamicPrompt(recentContext);
       
-      const prompt = `Analyze this speech transcript for entity errors.
-
-Text: "${recentContext}"
-
-Common patterns:
-- Homophones: NBC→NBA, MVW→MVP
-- Names based on context
-
-Return JSON:
-{
-  "topic": "topic",
-  "corrections": [{"original": "X", "corrected": "Y", "confidence": 0.9}]
-}`;
-
-      const response = await initializeOpenAI(process.env.OPENAI_API_KEY).chat.completions.create({
+      // 🔧 FIX: Session'daki API key kullan (this.apiKey)
+      const response = await initializeOpenAI(this.apiKey || process.env.OPENAI_API_KEY).chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
           {
             role: 'system',
-            content: 'You are an expert at correcting entity errors. Respond with JSON only.',
+            content: 'You are an expert at correcting speech transcription errors. Respond with JSON only.',
           },
           {
             role: 'user',
-            content: prompt,
+            content: dynamicPrompt,
           },
         ],
-        temperature: 0.2, // 0.3'ten 0.2'ye düşür (daha deterministik)
-        max_tokens: 200, // Token limitini ekle (hız için)
+        temperature: 0.2,
+        max_tokens: 200,
         response_format: { type: 'json_object' },
       });
 

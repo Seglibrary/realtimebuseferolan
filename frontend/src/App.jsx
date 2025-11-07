@@ -589,23 +589,39 @@ const RealtimeTranslator = () => {
                 chunks.map((chunk) => (
                   <div 
                     key={chunk.id} 
-                    className="bg-slate-700/50 rounded-lg p-4 border border-slate-600"
+                    className={`
+                      rounded-lg p-4 border transition-all duration-300
+                      ${chunk.transcript.status === 'corrected' 
+                        ? 'bg-green-900/20 border-green-500/50' 
+                        : 'bg-slate-700/50 border-slate-600'
+                      }
+                    `}
                   >
                     {/* Transcript */}
                     <div className="mb-2">
                       <span className="text-xs text-gray-400 mr-2">🎤</span>
                       <span className="text-gray-200">{chunk.transcript.original}</span>
                       {chunk.transcript.corrected && (
-                        <span className="text-green-400 ml-2">
-                          → {chunk.transcript.corrected}
-                        </span>
+                        <div className="ml-6 mt-1 animate-fade-in">
+                          <span className="text-green-400">
+                            → {chunk.transcript.corrected}
+                          </span>
+                        </div>
                       )}
                       {/* 🆕 ADIM 1.0d: Düzeltme detayları */}
                       {chunk.transcript.corrections && chunk.transcript.corrections.length > 0 && (
-                        <div className="text-xs text-green-300 mt-1 ml-6">
-                          ✓ Corrected: {chunk.transcript.corrections.map(c => 
-                            `"${c.original}" → "${c.corrected}"`
-                          ).join(', ')}
+                        <div className="text-xs text-green-300 mt-1 ml-6 animate-fade-in">
+                          ✓ Corrected: {chunk.transcript.corrections.map((correction, idx) => 
+                            <span key={idx}>
+                              "{correction.original}" → "{correction.corrected}"
+                              {/* 🆕 ADIM 2.3: Confidence badge */}
+                              {correction.confidence && (
+                                <span className="ml-2 px-2 py-0.5 bg-green-500/20 rounded text-green-400">
+                                  {Math.round(correction.confidence * 100)}%
+                                </span>
+                              )}
+                            </span>
+                          )}
                         </div>
                       )}
                     </div>
@@ -617,14 +633,24 @@ const RealtimeTranslator = () => {
                         <span className="text-gray-500 italic">Waiting...</span>
                       ) : chunk.translation.status === 'translating' ? (
                         <span className="text-blue-300 animate-pulse">{chunk.translation.text}</span>
+                      ) : chunk.translation.status === 'retranslating' ? (
+                        <span className="text-yellow-300 animate-pulse">
+                          🔄 Retranslating... {chunk.translation.text}
+                        </span>
                       ) : (
                         <span className="text-blue-200">{chunk.translation.text}</span>
                       )}
                     </div>
                     
-                    {/* Debug: Chunk ID */}
-                    <div className="text-xs text-gray-600 mt-1">
-                      ID: {chunk.id.slice(-12)}
+                    {/* Debug: Chunk ID + Status */}
+                    <div className="text-xs text-gray-600 mt-1 flex items-center gap-2">
+                      <span>ID: {chunk.id.slice(-12)}</span>
+                      {/* 🆕 ADIM 2.3: Status indicator */}
+                      {chunk.transcript.status === 'corrected' && (
+                        <span className="px-2 py-0.5 bg-green-500/20 rounded text-green-400">
+                          ✓ Corrected
+                        </span>
+                      )}
                     </div>
                   </div>
                 ))
