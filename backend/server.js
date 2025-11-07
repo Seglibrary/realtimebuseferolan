@@ -51,11 +51,49 @@ class TranscriptionSession {
     this.lastTranscriptTime = Date.now();
     this.correctionCache = new Map(); // Düzeltme önbelleği
     this.targetLanguage = 'en'; // Hedef çeviri dili
+    
+    // 🆕 ADIM 1.0a: Atomik ID sistemi
+    this.chunkCounter = 0; // Benzersiz ID için sayaç
+    this.chunksMap = new Map(); // ID → Chunk mapping
+    
+    // 🆕 ADIM 1.4: Cleanup mekanizması
+    this.MAX_CHUNKS = 200; // Maksimum chunk sayısı
+    this.CLEANUP_INTERVAL = 30000; // 30 saniye cleanup
+    this.startCleanupTimer();
+  }
+  
+  // 🆕 ADIM 1.4: Periyodik cleanup
+  startCleanupTimer() {
+    this.cleanupTimer = setInterval(() => {
+      this.cleanupOldChunks();
+    }, this.CLEANUP_INTERVAL);
+  }
+  
+  // 🆕 ADIM 1.4: Eski chunk'ları temizle
+  cleanupOldChunks() {
+    const chunkCount = this.chunksMap.size;
+    
+    if (chunkCount <= this.MAX_CHUNKS) {
+      console.log(`✅ Chunk cleanup: ${chunkCount}/${this.MAX_CHUNKS} (OK)`);
+      return;
+    }
+    
+    // En eski chunk'ları sil (FIFO)
+    const chunksToDelete = chunkCount - this.MAX_CHUNKS;
+    const sortedChunks = Array.from(this.chunksMap.keys()).sort();
+    
+    for (let i = 0; i < chunksToDelete; i++) {
+      const chunkId = sortedChunks[i];
+      this.chunksMap.delete(chunkId);
+      console.log(`🗑️ Deleted old chunk: ${chunkId}`);
+    }
+    
+    console.log(`✅ Chunk cleanup: ${this.chunksMap.size}/${this.MAX_CHUNKS} (Cleaned ${chunksToDelete} chunks)`);
   }
 
   // Rolling context window (60 saniye)
-  addToContext(text, timestamp) {
-    this.contextBuffer.push({ text, timestamp });
+  addToContext(text, timestamp, id) { // 🆕 YENİ: id parametresi eklendi
+    this.contextBuffer.push({ id, text, timestamp }); // 🆕 id eklendi
     this.transcriptsSinceLastAnalysis++;
     this.lastTranscriptTime = timestamp;
     
@@ -189,33 +227,40 @@ class TranscriptionSession {
       case 'conversation.item.input_audio_transcription.completed':
         const transcript = event.transcript;
         const timestamp = Date.now();
+        const chunkId = `chunk-${Date.now()}-${this.chunkCounter++}`; // 🆕 ADIM 1.0a: Benzersiz ID
         
-        console.log('📝 Transcript:', transcript);
+        console.log('📝 Transcript:', transcript, '| ID:', chunkId); // 🆕 ID de logla
         
-        // Context buffer'a ekle
-        this.addToContext(transcript, timestamp);
+        // 🆕 ADIM 1.0a: Chunks map'e ekle
+        this.chunksMap.set(chunkId, {
+          id: chunkId,
+          text: transcript,
+          timestamp,
+          corrected: false,
+          translationSent: false
+        });
         
-        // Client'a gönder (ham transcript)
+        // Context buffer'a ekle (şimdi ID ile)
+        this.addToContext(transcript, timestamp, chunkId); // 🆕 chunkId parametresi eklendi
+        
+        // Client'a gönder (ID ile)
         this.ws.send(JSON.stringify({
           type: 'transcript',
           data: {
+            id: chunkId, // 🆕 YENİ: ID eklendi
             text: transcript,
             timestamp,
             corrected: false,
           },
         }));
         
-        // YENİ: Akıllı tetikleme
-        if (this.shouldTriggerAnalysis()) {
-          this.lastAnalysisTime = Date.now();
-          this.transcriptsSinceLastAnalysis = 0;
-          
-          // Paralel çalıştır: düzeltme ve çeviriyi aynı anda başlat
-          Promise.all([
-            this.analyzeAndCorrect(),
-            this.autoTranslate() // YENİ fonksiyon
-          ]).catch(err => console.error('Analysis error:', err));
-        }
+        // 🔧 FIX: Her chunk için tetikle (shouldTriggerAnalysis kontrolü kaldırıldı)
+        // Paralel çalıştır: düzeltme ve çeviriyi aynı anda başlat
+        Promise.all([
+          this.analyzeAndCorrect(),
+          this.autoTranslate(chunkId) // Her chunk için çeviri
+        ]).catch(err => console.error('Analysis error:', err));
+        
         break;
 
       case 'conversation.item.input_audio_transcription.failed':
@@ -246,7 +291,8 @@ class TranscriptionSession {
 
   // YENİ: Cache'li düzeltme
   async analyzeAndCorrect() {
-    if (this.currentContext.length < 30) return; // 50'den 30'a düşür
+    // 🔧 FIX: Minimum context kontrolü kaldırıldı - ilk cümleden itibaren düzelt
+    if (this.currentContext.length < 5) return; // Sadece çok kısa metinleri atla
 
     try {
       // Cache kontrolü - son 20 kelimeyi key olarak kullan
@@ -322,21 +368,55 @@ Return JSON:
         corrections: result.corrections,
       },
     }));
+    
+    // 🆕 ADIM 1.0d: Düzeltme sonrası yeniden çeviri
+    if (result.corrections && result.corrections.length > 0) {
+      this.retranslateAffectedChunks(result.corrections);
+    }
+  }
+  
+  // 🆕 ADIM 1.0d: Etkilenen chunk'ları yeniden çevir
+  async retranslateAffectedChunks(corrections) {
+    if (!this.targetLanguage || this.targetLanguage === 'Original') return;
+    
+    // Her düzeltme için etkilenen chunk'ları bul
+    corrections.forEach(async (correction) => {
+      // chunksMap'te düzeltilen kelimeyi içeren chunk'ları bul
+      for (const [chunkId, chunk] of this.chunksMap.entries()) {
+        if (chunk.text.includes(correction.original)) {
+          console.log(`🔄 Retranslating chunk ${chunkId}: "${correction.original}" → "${correction.corrected}"`);
+          
+          // Düzeltilmiş metni oluştur
+          const correctedText = chunk.text.replace(
+            new RegExp(correction.original, 'gi'),
+            correction.corrected
+          );
+          
+          // Chunk'ı güncelle
+          chunk.corrected = correctedText;
+          
+          // Yeniden çevir
+          await this.translate(correctedText, this.targetLanguage, chunkId);
+        }
+      }
+    });
   }
 
-  // YENİ: Otomatik çeviri (debounce olmadan)
-  async autoTranslate() {
-    // Son 3 transkripti al (daha kısa context)
-    const recentTranscripts = this.contextBuffer
-      .slice(-3)
-      .map(item => item.text)
-      .join(' ');
+  // YENİ: Otomatik çeviri - HER CHUNK için tetiklenir
+  async autoTranslate(chunkId) { // 🆕 ADIM 1.0c: chunkId parametresi eklendi
+    // 🔧 FIX: Sadece bu chunk'ı çevir (cumulative değil!)
+    const chunk = this.chunksMap.get(chunkId);
+    if (!chunk) return;
     
-    if (recentTranscripts.length < 20) return; // Çok kısa metinleri atla
+    const textToTranslate = chunk.text;
+    if (textToTranslate.length < 5) return; // Çok kısa metinleri atla
     
-    // Çeviriyi başlat (frontend'den gelen hedef dil ile)
+    // Chunk'ı işaretle (çeviri gönderildi)
+    chunk.translationSent = true;
+    
+    // Çeviriyi başlat (sadece bu chunk'ın metni)
     if (this.targetLanguage && this.targetLanguage !== 'Original') {
-      await this.translate(recentTranscripts, this.targetLanguage);
+      await this.translate(textToTranslate, this.targetLanguage, chunkId);
     }
   }
 
@@ -350,17 +430,15 @@ Return JSON:
     }
   }
 
-  async translate(text, targetLanguage) {
+  async translate(text, targetLanguage, chunkId) { // 🆕 ADIM 1.0c: chunkId parametresi eklendi
     try {
-      // YENİ: Daha kısa context (500'den 200'e)
-      const shortContext = this.currentContext.slice(-200);
-      
+      // 🔧 FIX: Context kaldırıldı - her chunk bağımsız çevrilsin
       const stream = await initializeOpenAI(process.env.OPENAI_API_KEY).chat.completions.create({
         model: 'gpt-4o',
         messages: [
           {
             role: 'system',
-            content: `Translate to ${targetLanguage}. Preserve names and brands. Context: ${shortContext}`,
+            content: `Translate to ${targetLanguage}. Preserve names and brands. Translate ONLY the given text, nothing more.`,
           },
           {
             role: 'user',
@@ -371,13 +449,16 @@ Return JSON:
         stream: true,
       });
 
-      // Stream başladı işareti
+      // Stream başladı işareti (🆕 for_chunk_id eklendi)
       this.ws.send(JSON.stringify({
         type: 'translation_start',
-        data: { language: targetLanguage }
+        data: { 
+          language: targetLanguage,
+          for_chunk_id: chunkId // 🆕 ADIM 1.0c: Hangi chunk için
+        }
       }));
 
-      // Stream translation to client
+      // Stream translation to client (🆕 for_chunk_id eklendi)
       for await (const chunk of stream) {
         const content = chunk.choices[0]?.delta?.content || '';
         if (content) {
@@ -387,17 +468,19 @@ Return JSON:
               text: content,
               language: targetLanguage,
               partial: true,
+              for_chunk_id: chunkId // 🆕 ADIM 1.0c
             },
           }));
         }
       }
 
-      // Translation complete
+      // Translation complete (🆕 for_chunk_id eklendi)
       this.ws.send(JSON.stringify({
         type: 'translation',
         data: {
           language: targetLanguage,
           partial: false,
+          for_chunk_id: chunkId // 🆕 ADIM 1.0c
         },
       }));
 
@@ -407,6 +490,12 @@ Return JSON:
   }
 
   disconnect() {
+    // 🆕 ADIM 1.4: Cleanup timer'ı durdur
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      console.log('🛑 Cleanup timer stopped');
+    }
+    
     if (this.realtimeWs) {
       this.realtimeWs.close();
     }

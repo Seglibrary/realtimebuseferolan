@@ -4,8 +4,18 @@ import { Mic, MicOff, Globe, Loader, CheckCircle, AlertCircle, Zap } from 'lucid
 const RealtimeTranslator = () => {
   const [isRecording, setIsRecording] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
-  const [transcript, setTranscript] = useState([]);
-  const [translation, setTranslation] = useState('');
+  
+  // 🆕 ADIM 1.0b: Unified chunks state (transcript + translation birlikte)
+  const [chunks, setChunks] = useState([]);
+  // Chunk yapısı: { id, transcript: { original, corrected, timestamp, status }, translation: { text, status, timestamp } }
+  
+  // 🆕 ADIM 1.4: Cleanup konfigürasyonu
+  const MAX_CHUNKS_DISPLAY = 100; // UI'da max 100 chunk göster
+  
+  // ⚠️ ESKİ state'ler (geçici olarak tutuyoruz, sonra sileceğiz)
+  const [transcript, setTranscript] = useState([]); // Artık kullanılmayacak
+  const [translation, setTranslation] = useState(''); // Artık kullanılmayacak
+  
   const [currentTopic, setCurrentTopic] = useState('');
   const [targetLanguage, setTargetLanguage] = useState('English');
   const [status, setStatus] = useState('Disconnected');
@@ -107,9 +117,36 @@ const RealtimeTranslator = () => {
         setLatencyStats(prev => ({ ...prev, stt: sttLatency }));
         lastTranscriptTimeRef.current = now;
         
-        // Yeni transcript geldi
+        // 🆕 ADIM 1.0b: Yeni chunk oluştur (unified state)
+        setChunks(prev => [...prev, {
+          id: message.data.id, // Backend'den gelen ID
+          transcript: {
+            original: message.data.text,
+            corrected: null,
+            timestamp: message.data.timestamp,
+            status: 'pending' // pending, correcting, corrected
+          },
+          translation: {
+            text: '',
+            status: 'none', // none, translating, done, retranslating
+            timestamp: null
+          }
+        }]);
+        
+        // 🆕 ADIM 1.4: Otomatik cleanup (MAX_CHUNKS_DISPLAY aşarsa)
+        setChunks(prev => {
+          if (prev.length > MAX_CHUNKS_DISPLAY) {
+            // En eski chunk'ları sil (FIFO)
+            const chunksToRemove = prev.length - MAX_CHUNKS_DISPLAY;
+            console.log(`🗑️ Frontend cleanup: Removing ${chunksToRemove} old chunks`);
+            return prev.slice(chunksToRemove);
+          }
+          return prev;
+        });
+        
+        // ⚠️ ESKİ kod (yedek - sonra sileceğiz)
         setTranscript(prev => [...prev, {
-          id: Date.now(),
+          id: message.data.id || Date.now(),
           text: message.data.text,
           timestamp: message.data.timestamp,
           corrected: false,
@@ -124,12 +161,60 @@ const RealtimeTranslator = () => {
         break;
 
       case 'translation_start':
-        // Çeviri başladı - eski çeviriyi temizle
+        // 🆕 ADIM 1.0b: Bu chunk için çeviri başladı
+        if (message.data.for_chunk_id) {
+          setChunks(prev => prev.map(chunk => {
+            if (chunk.id === message.data.for_chunk_id) {
+              return {
+                ...chunk,
+                translation: {
+                  text: '',
+                  status: 'translating',
+                  timestamp: now
+                }
+              };
+            }
+            return chunk;
+          }));
+        }
+        
+        // ⚠️ ESKİ kod (yedek)
         setTranslation('');
         break;
 
       case 'translation':
-        // Çeviri geldi
+        // 🆕 ADIM 1.0b: Streaming translation (chunk bazlı)
+        if (message.data.for_chunk_id && message.data.partial) {
+          setChunks(prev => prev.map(chunk => {
+            if (chunk.id === message.data.for_chunk_id) {
+              return {
+                ...chunk,
+                translation: {
+                  text: chunk.translation.text + message.data.text,
+                  status: 'translating',
+                  timestamp: now
+                }
+              };
+            }
+            return chunk;
+          }));
+        } else if (message.data.for_chunk_id && !message.data.partial) {
+          // Translation tamamlandı
+          setChunks(prev => prev.map(chunk => {
+            if (chunk.id === message.data.for_chunk_id) {
+              return {
+                ...chunk,
+                translation: {
+                  ...chunk.translation,
+                  status: 'done'
+                }
+              };
+            }
+            return chunk;
+          }));
+        }
+        
+        // ⚠️ ESKİ kod (yedek - henüz for_chunk_id backend'den gelmiyor)
         if (message.data.partial) {
           setTranslation(prev => prev + message.data.text);
         }
@@ -168,8 +253,9 @@ const RealtimeTranslator = () => {
     }
   };
 
-  // Düzeltmeleri uygula
+  // Düzeltmeleri uygula (🆕 ADIM 1.0d: chunks state'e uygulandı)
   const applyCorrections = (corrections) => {
+    // Eski transcript state için (geriye uyumluluk)
     setTranscript(prev => {
       const updated = [...prev];
       
@@ -187,6 +273,39 @@ const RealtimeTranslator = () => {
       });
       
       return updated;
+    });
+    
+    // 🆕 YENİ: chunks state'e de uygula
+    setChunks(prev => {
+      return prev.map(chunk => {
+        // Bu chunk'ta düzeltme var mı?
+        const affectedCorrections = corrections.filter(c => 
+          chunk.transcript.original?.includes(c.original)
+        );
+        
+        if (affectedCorrections.length > 0) {
+          // Düzeltilmiş metni oluştur
+          let correctedText = chunk.transcript.original;
+          affectedCorrections.forEach(c => {
+            correctedText = correctedText.replace(
+              new RegExp(c.original, 'gi'),
+              c.corrected
+            );
+          });
+          
+          return {
+            ...chunk,
+            transcript: {
+              ...chunk.transcript,
+              corrected: correctedText,
+              status: 'corrected',
+              corrections: affectedCorrections
+            }
+          };
+        }
+        
+        return chunk;
+      });
     });
   };
 
@@ -450,6 +569,72 @@ const RealtimeTranslator = () => {
         {/* Main Content Grid */}
         <div className="grid grid-cols-2 gap-6 mb-6">
           
+          {/* 🆕 ADIM 1.0b: Unified Chunks Panel (Transcript + Translation birlikte) */}
+          <div className="bg-slate-800/50 backdrop-blur rounded-xl p-6 col-span-2">
+            <h2 className="text-xl font-semibold mb-4 flex items-center gap-2">
+              <Zap className="w-5 h-5 text-yellow-400" />
+              Real-time Transcript & Translation (Chunk-based)
+              {/* 🆕 ADIM 1.4: Chunk sayısı göstergesi */}
+              <span className="text-xs text-gray-400 ml-auto">
+                {chunks.length}/{MAX_CHUNKS_DISPLAY} chunks
+              </span>
+            </h2>
+            
+            <div className="h-96 overflow-y-auto space-y-4 pr-2">
+              {chunks.length === 0 ? (
+                <div className="text-gray-500 text-center mt-20">
+                  Start recording to see chunks...
+                </div>
+              ) : (
+                chunks.map((chunk) => (
+                  <div 
+                    key={chunk.id} 
+                    className="bg-slate-700/50 rounded-lg p-4 border border-slate-600"
+                  >
+                    {/* Transcript */}
+                    <div className="mb-2">
+                      <span className="text-xs text-gray-400 mr-2">🎤</span>
+                      <span className="text-gray-200">{chunk.transcript.original}</span>
+                      {chunk.transcript.corrected && (
+                        <span className="text-green-400 ml-2">
+                          → {chunk.transcript.corrected}
+                        </span>
+                      )}
+                      {/* 🆕 ADIM 1.0d: Düzeltme detayları */}
+                      {chunk.transcript.corrections && chunk.transcript.corrections.length > 0 && (
+                        <div className="text-xs text-green-300 mt-1 ml-6">
+                          ✓ Corrected: {chunk.transcript.corrections.map(c => 
+                            `"${c.original}" → "${c.corrected}"`
+                          ).join(', ')}
+                        </div>
+                      )}
+                    </div>
+                    
+                    {/* Translation */}
+                    <div className="text-sm">
+                      <span className="text-xs text-blue-400 mr-2">🌍</span>
+                      {chunk.translation.status === 'none' ? (
+                        <span className="text-gray-500 italic">Waiting...</span>
+                      ) : chunk.translation.status === 'translating' ? (
+                        <span className="text-blue-300 animate-pulse">{chunk.translation.text}</span>
+                      ) : (
+                        <span className="text-blue-200">{chunk.translation.text}</span>
+                      )}
+                    </div>
+                    
+                    {/* Debug: Chunk ID */}
+                    <div className="text-xs text-gray-600 mt-1">
+                      ID: {chunk.id.slice(-12)}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+          
+          {/* ⚠️ ESKİ paneller (yedek - şimdilik gizli, sonra sileceğiz) */}
+          {false && (
+            <>
           {/* Original Transcript Panel */}
           <div className="bg-slate-800/50 backdrop-blur rounded-xl p-6">
             <h2 className="text-xl font-semibold mb-4 flex items-center gap-2">
@@ -488,6 +673,8 @@ const RealtimeTranslator = () => {
               )}
             </div>
           </div>
+            </>
+          )}
         </div>
 
         {/* Control Buttons */}
@@ -513,6 +700,7 @@ const RealtimeTranslator = () => {
 
           <button
             onClick={() => {
+              setChunks([]); // 🆕 YENİ: chunks'ı temizle
               setTranscript([]);
               setTranslation('');
             }}
