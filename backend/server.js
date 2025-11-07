@@ -32,6 +32,201 @@ const initializeOpenAI = (apiKey) => {
 // Session Management
 const sessions = new Map();
 
+// 🆕 HAFTA 3 - ADIM 3.1: Embedding Cache Sistemi
+class EmbeddingCache {
+  constructor() {
+    this.cache = new Map();
+    this.maxSize = 1000;
+    this.ttl = 3600000; // 1 saat
+  }
+  
+  async getEmbedding(text, openaiClient) {
+    const key = text.toLowerCase().trim();
+    
+    if (this.cache.has(key)) {
+      const cached = this.cache.get(key);
+      if (Date.now() - cached.timestamp < this.ttl) {
+        console.log(`💾 Embedding cache hit: "${key.substring(0, 20)}..."`);
+        return cached.embedding; // Cache hit! ⚡
+      }
+    }
+    
+    // Cache miss: API call
+    console.log(`🔍 Embedding cache miss: "${key.substring(0, 20)}..." - fetching from API`);
+    const response = await openaiClient.embeddings.create({
+      model: "text-embedding-3-small",
+      input: text
+    });
+    
+    const embedding = response.data[0].embedding;
+    
+    this.cache.set(key, {
+      embedding,
+      timestamp: Date.now()
+    });
+    
+    // Cache boyut kontrolü
+    if (this.cache.size > this.maxSize) {
+      const firstKey = this.cache.keys().next().value;
+      this.cache.delete(firstKey);
+      console.log(`🗑️ Embedding cache cleanup: removed oldest entry`);
+    }
+    
+    return embedding;
+  }
+  
+  // Cache istatistikleri
+  getStats() {
+    return {
+      size: this.cache.size,
+      maxSize: this.maxSize,
+      ttl: this.ttl
+    };
+  }
+}
+
+// Global embedding cache instance
+const embeddingCache = new EmbeddingCache();
+
+// Cosine similarity hesaplama fonksiyonu
+function cosineSimilarity(a, b) {
+  const dot = a.reduce((sum, val, i) => sum + val * b[i], 0);
+  const normA = Math.sqrt(a.reduce((sum, val) => sum + val * val, 0));
+  const normB = Math.sqrt(b.reduce((sum, val) => sum + val * val, 0));
+  return dot / (normA * normB);
+}
+
+// 🆕 HAFTA 3 - ADIM 3.2: Context Similarity Check
+async function checkWithEmbedding(uncertainWord, context, openaiClient) {
+  console.log(`🔍 Checking "${uncertainWord}" with embedding...`);
+  
+  // 1. Belirsiz kelimenin embedding'i
+  const wordEmbed = await embeddingCache.getEmbedding(uncertainWord, openaiClient);
+  
+  // 2. Context'in embedding'i
+  const contextEmbed = await embeddingCache.getEmbedding(context, openaiClient);
+  
+  // 3. Similarity check
+  const similarity = cosineSimilarity(wordEmbed, contextEmbed);
+  
+  console.log(`📊 Embedding similarity for "${uncertainWord}": ${similarity.toFixed(2)}`);
+  
+  // 4. Three-tier decision
+  if (similarity >= 0.85) {
+    // Çok uyumlu, muhtemelen doğru
+    console.log(`✅ HIGH similarity (${similarity.toFixed(2)}) → ACCEPT_AS_IS`);
+    return {
+      action: 'ACCEPT_AS_IS',
+      confidence: similarity,
+      method: 'embedding',
+      word: uncertainWord
+    };
+  } else if (similarity < 0.50) {
+    // Çok uyumsuz, muhtemelen yanlış
+    console.log(`❌ LOW similarity (${similarity.toFixed(2)}) → LIKELY_WRONG, ask GPT`);
+    return {
+      action: 'LIKELY_WRONG_ASK_GPT',
+      confidence: similarity,
+      method: 'need_gpt'
+    };
+  } else {
+    // Belirsiz bölge (0.50-0.85)
+    console.log(`⚠️ MEDIUM similarity (${similarity.toFixed(2)}) → UNCERTAIN, ask GPT`);
+    return {
+      action: 'UNCERTAIN_ASK_GPT',
+      confidence: similarity,
+      method: 'need_gpt'
+    };
+  }
+}
+
+// 🆕 HAFTA 3 - ADIM 3.3: Hybrid Correction (GPT helper fonksiyonu)
+async function askGPTForCorrection(word, context, embeddingSimilarity, openaiClient) {
+  const prompt = `Correct this uncertain word in context:
+
+Word: "${word}"
+Context: "${context}"
+
+Embedding analysis: Similarity score is ${embeddingSimilarity.toFixed(2)} (0.0-1.0 scale).
+${embeddingSimilarity < 0.50 
+  ? 'Low similarity suggests the word is likely incorrect or out of context.' 
+  : 'Medium similarity suggests the word might be correct or needs minor correction.'}
+
+Task: Determine if the word needs correction. Consider:
+- Phonetic similarity to context-appropriate words
+- Semantic fit with the context
+- Common transcription errors
+- Language patterns
+
+Return JSON:
+{
+  "correction": "corrected word (or same if correct)",
+  "confidence": 0.95,
+  "reason": "brief explanation",
+  "changed": true/false
+}`;
+
+  const response = await openaiClient.chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [{ role: 'user', content: prompt }],
+    response_format: { type: 'json_object' },
+    temperature: 0.3,
+    max_tokens: 150
+  });
+  
+  const result = JSON.parse(response.choices[0].message.content);
+  
+  return {
+    correction: result.correction,
+    confidence: result.confidence,
+    changed: result.changed,
+    reason: result.reason
+  };
+}
+
+// 🆕 HAFTA 3 - ADIM 3.3: Hybrid Correction (Ana fonksiyon)
+async function correctWithHybrid(uncertainWord, context, openaiClient) {
+  console.log(`\n🔄 Hybrid correction for: "${uncertainWord}"`);
+  
+  // ADIM 1: Embedding pre-filter
+  const embeddingResult = await checkWithEmbedding(
+    uncertainWord,
+    context,
+    openaiClient
+  );
+  
+  if (embeddingResult.action === 'ACCEPT_AS_IS') {
+    // Kolay durum: Kelime context ile uyumlu, doğru olarak kabul et
+    console.log(`✅ "${uncertainWord}" accepted (embedding confidence: ${embeddingResult.confidence.toFixed(2)})`);
+    return {
+      correction: uncertainWord, // Değiştirme!
+      confidence: embeddingResult.confidence,
+      method: 'embedding',
+      fast: true
+    };
+  } else {
+    // Zor durum: GPT'ye sor
+    console.log(`🤔 "${uncertainWord}" uncertain, asking GPT (embedding: ${embeddingResult.confidence.toFixed(2)})`);
+    
+    const gptResult = await askGPTForCorrection(
+      uncertainWord,
+      context,
+      embeddingResult.confidence, // Embedding skorunu ver
+      openaiClient
+    );
+    
+    console.log(`📝 GPT result: "${gptResult.correction}" (confidence: ${gptResult.confidence}, changed: ${gptResult.changed})`);
+    
+    return {
+      correction: gptResult.correction,
+      confidence: gptResult.confidence,
+      method: 'gpt',
+      fast: false,
+      reason: gptResult.reason
+    };
+  }
+}
+
 class TranscriptionSession {
   constructor(ws) {
     this.ws = ws;

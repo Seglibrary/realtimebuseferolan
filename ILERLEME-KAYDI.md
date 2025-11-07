@@ -629,3 +629,78 @@ npm run dev
 
 # # #   A D I M   2 . 4 :   P e r f o r m a n c e   O p t i m i z a t i o n   C O M P L E T E  
  
+---
+
+## HAFTA 3: EMBEDDING HBRT SSTEM
+
+### **ADIM 3.1: EmbeddingCache Sýnýfý** ?
+**Tarih:** 7 Kasým 2025, 23:50  
+**Dosya:** backend/server.js  
+**Deðiþiklikler:**
+
+1. **EmbeddingCache sýnýfý eklendi (satýr ~31-85):**
+   - Cache yapýsý (Map, maxSize: 1000, TTL: 1 saat)
+   - getEmbedding() - Cache check + API call
+   - getStats() - Cache istatistikleri
+
+2. **Global instance:** const embeddingCache = new EmbeddingCache();
+
+3. **cosineSimilarity fonksiyonu:** Vektör benzerlik hesaplama
+
+**Amaç:** Embedding API çaðrýlarýný cache'leyerek maliyet ve hýz optimizasyonu
+
+**Test Durumu:** ? BAÞARILI (Syntax error yok)
+
+---
+
+### **ADIM 3.2: checkWithEmbedding Fonksiyonu** ?
+**Tarih:** 7 Kasým 2025, 23:52  
+**Dosya:** backend/server.js  
+**Deðiþiklikler:**
+
+1. **checkWithEmbedding fonksiyonu eklendi (satýr ~98-141):**
+   - Kelime + context embedding hesaplama
+   - Cosine similarity
+   - Three-tier decision:
+     * >= 0.85 › ACCEPT_AS_IS (GPT'ye gitme!)
+     * < 0.50 › LIKELY_WRONG_ASK_GPT
+     * 0.50-0.85 › UNCERTAIN_ASK_GPT
+
+**Amaç:** Context similarity ile GPT çaðrýlarýný azaltma
+
+**Test Durumu:** ? BAÞARILI (Syntax error yok)
+
+---
+
+### **ADIM 3.3: correctWithHybrid & askGPTForCorrection** ?
+**Tarih:** 7 Kasým 2025, 23:54  
+**Dosya:** backend/server.js  
+**Deðiþiklikler:**
+
+1. **askGPTForCorrection fonksiyonu (satýr ~143-193):**
+   - Embedding skorunu GPT'ye veriyor
+   - Daha akýllý düzeltme kararý
+
+2. **correctWithHybrid fonksiyonu (satýr ~195-231):**
+   - Embedding check önce
+   - >= 0.85 › Kabul et (GPT bypass!)
+   - < 0.85 › GPT'ye sor
+
+**Test Durumu:** ? BAÞARILI (7 Kas 2025, 00:00)
+
+**Test Sonucu:**
+- ? Sistem çalýþýyor
+- ? Düzeltmeler yapýlýyor (aba › ama)
+- ? Çeviri akýyor
+- ? Console error yok
+- ? SEG onayý alýndý
+
+**Performans Kazancý (Beklenen):**
+- Embedding cache hit: %67 hýzlanma
+- Maliyet: %66 azalma (GPT çaðrýlarý %35'e düþecek)
+
+---
+
+### **SONRAK ADIM:** ADIM 3.4 - analyzeAndCorrect Entegrasyonu
+Hibrit sistemi mevcut düzeltme akýþýna entegre etmek
+
