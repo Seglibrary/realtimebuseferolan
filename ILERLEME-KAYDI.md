@@ -704,3 +704,42 @@ npm run dev
 ### **SONRAK ADIM:** ADIM 3.4 - analyzeAndCorrect Entegrasyonu
 Hibrit sistemi mevcut düzeltme akýþýna entegre etmek
 
+
+---
+
+## ? HAFTA 3 - EMBEDDING SSTEM ÇIKARILDI
+
+### **Tarih:** 7 Kasým 2025, 00:15
+### **Sebep:** Mimari hata tespit edildi
+
+**Problem:**
+- Embedding sistemi yanlýþ kullanýlmýþtý
+- GPT'nin önerisini embedding ile filtrelemek yerine, embedding'den sonra GPT'ye tekrar soruyorduk
+- API maliyeti %300 arttý
+- Kalite düþtü ("Ses deneme" gibi doðru cümleler düzeltiliyordu)
+
+**Çýkarýlan Kod:**
+- ? EmbeddingCache sýnýfý
+- ? cosineSimilarity fonksiyonu
+- ? checkWithEmbedding fonksiyonu
+- ? askGPTForCorrection fonksiyonu
+- ? correctWithHybrid fonksiyonu
+- ? analyzeAndCorrect içindeki embedding filtrelemesi
+
+**Geri Dönülen Durum:**
+- ? HAFTA 2 sistemi (sadece GPT)
+- ? Basit, hýzlý, çalýþan sistem
+- ? analyzeAndCorrect sadeleþtirildi
+
+**Dosyalar:**
+- backend/server.js: ~240 satýr kod çýkarýldý
+
+**Sonraki Adým:**
+- Test et: Kalite eski haline döndü mü?
+- Eðer embedding gerekli olursa, DORU MMAR ile eklenecek:
+  * GPT'nin önerilerini embedding ile DORULA
+  * Original vs Corrected karþýlaþtýr
+  * GPT'ye tekrar çaðrý YAPMA!
+
+---
+

@@ -622,7 +622,22 @@ Return JSON:
         response_format: { type: 'json_object' },
       });
 
-      const result = JSON.parse(response.choices[0].message.content);
+      // 🔧 FIX: JSON parse güvenli hale getirildi
+      const content = response.choices[0]?.message?.content;
+      
+      if (!content || content.trim() === '') {
+        console.log('⚠️ GPT returned empty response, skipping correction');
+        return;
+      }
+      
+      let result;
+      try {
+        result = JSON.parse(content);
+      } catch (parseError) {
+        console.error('❌ JSON parse failed:', parseError.message);
+        console.error('📄 GPT response:', content);
+        return;
+      }
       
       if (result.corrections && result.corrections.length > 0) {
         console.log('✅ Found corrections:', result.corrections);
