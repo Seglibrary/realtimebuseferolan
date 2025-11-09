@@ -32,6 +32,13 @@ const initializeOpenAI = (apiKey) => {
 // Session Management
 const sessions = new Map();
 
+// 🆕 HAFTA 3 - Helper: Context Penceresi (Cümle Bazlı)
+function getContextWindow(contextBuffer, maxSentences = 3) {
+  const text = contextBuffer.map(b => b.text).join(' ');
+  const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+  return sentences.slice(-maxSentences).join(' ').slice(-600);
+}
+
 // 🆕 HAFTA 3 - ADIM 3.1: Embedding Cache Sistemi
 class EmbeddingCache {
   constructor() {
@@ -224,6 +231,38 @@ async function correctWithHybrid(uncertainWord, context, openaiClient) {
       fast: false,
       reason: gptResult.reason
     };
+  }
+}
+
+// 🆕 HAFTA 3 - ADIM 3.3: Embedding Validation (GPT Sonuçlarını Filtrele)
+async function validateCorrectionWithEmbedding(original, corrected, context, openaiClient) {
+  try {
+    // 3 embedding call (parallel)
+    const [originalEmbed, correctedEmbed, contextEmbed] = await Promise.all([
+      embeddingCache.getEmbedding(original, openaiClient),
+      embeddingCache.getEmbedding(corrected, openaiClient),
+      embeddingCache.getEmbedding(context, openaiClient)
+    ]);
+    
+    const originalScore = cosineSimilarity(originalEmbed, contextEmbed);
+    const correctedScore = cosineSimilarity(correctedEmbed, contextEmbed);
+    const improvement = correctedScore - originalScore;
+    
+    console.log(`📊 Embedding: "${original}" (${originalScore.toFixed(2)}) vs "${corrected}" (${correctedScore.toFixed(2)}) → Δ${improvement.toFixed(2)}`);
+    
+    // Threshold-based decision
+    if (improvement >= 0.15) {
+      return { valid: true, confidence: correctedScore, reason: 'embedding_approved' };
+    } else if (improvement < -0.10) {
+      return { valid: false, confidence: originalScore, reason: 'embedding_rejected' };
+    } else {
+      // Belirsiz zone (0.10 - 0.15) → GPT'ye güven
+      return { valid: true, confidence: correctedScore, reason: 'embedding_uncertain' };
+    }
+  } catch (error) {
+    console.error('❌ Embedding validation failed:', error);
+    // Fallback: GPT'ye güven
+    return { valid: true, confidence: 0.5, reason: 'embedding_error' };
   }
 }
 
@@ -580,18 +619,18 @@ Return JSON:
 
       console.log('🔍 Analyzing context...');
       
-      // 🆕 ADIM 2.4: Performans optimizasyonu
-      const recentContext = this.currentContext.slice(-200);
+      // 🆕 HAFTA 3: Cümle bazlı context (son 3 cümle)
+      const context = getContextWindow(this.contextBuffer, 3);
       
       // Background'da keyword extraction (bekleme yok!)
-      this.buildDynamicPrompt(recentContext).catch(err => 
+      this.buildDynamicPrompt(context).catch(err => 
         console.error('❌ Keyword extraction background error:', err)
       );
       
       // Hızlı prompt kullan (keyword extraction beklemeden)
       const quickPrompt = `Analyze this speech transcript for transcription errors.
 
-Text: "${recentContext}"
+Text: "${context}"
 
 Common errors:
 - Homophones (hear/here, see/sea)
@@ -640,15 +679,45 @@ Return JSON:
       }
       
       if (result.corrections && result.corrections.length > 0) {
-        console.log('✅ Found corrections:', result.corrections);
+        console.log(`🔍 GPT found ${result.corrections.length} potential corrections`);
         
-        // Cache'e ekle
-        this.correctionCache.set(contextKey, {
-          data: result,
-          timestamp: Date.now()
-        });
+        // 🆕 HAFTA 3: Embedding validation (GPT sonuçlarını filtrele)
+        const validatedCorrections = [];
+        let rejectedCount = 0;
         
-        this.sendCorrections(result);
+        for (const correction of result.corrections) {
+          const validation = await validateCorrectionWithEmbedding(
+            correction.original,
+            correction.corrected,
+            context,
+            initializeOpenAI(this.apiKey || process.env.OPENAI_API_KEY)
+          );
+          
+          if (validation.valid) {
+            // Embedding onayladı, confidence ekle
+            correction.embeddingConfidence = validation.confidence;
+            correction.validationReason = validation.reason;
+            validatedCorrections.push(correction);
+            console.log(`✅ Accepted: "${correction.original}" → "${correction.corrected}" (${validation.reason})`);
+          } else {
+            // Embedding reddetti (false positive)
+            rejectedCount++;
+            console.log(`❌ Rejected: "${correction.original}" → "${correction.corrected}" (${validation.reason})`);
+          }
+        }
+        
+        console.log(`📊 Validation: ${validatedCorrections.length}/${result.corrections.length} accepted, ${rejectedCount} rejected`);
+        
+        // Sadece geçerli düzeltmeleri işle
+        if (validatedCorrections.length > 0) {
+          // Cache'e ekle
+          this.correctionCache.set(contextKey, {
+            data: { corrections: validatedCorrections },
+            timestamp: Date.now()
+          });
+          
+          this.sendCorrections({ corrections: validatedCorrections });
+        }
       }
 
     } catch (error) {
@@ -660,7 +729,7 @@ Return JSON:
     this.ws.send(JSON.stringify({
       type: 'corrections',
       data: {
-        topic: result.topic,
+        topic: result.topic || 'general', // Default topic
         corrections: result.corrections,
       },
     }));
